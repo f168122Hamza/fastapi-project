@@ -1,19 +1,22 @@
-from fastapi import FastAPI, HTTPException
-from dotenv import load_dotenv
-from openai import OpenAI
+from fastapi import FastAPI, HTTPException # type: ignore
+from dotenv import load_dotenv # type: ignore
+from openai import OpenAI # type: ignore
 import os
-from pydantic import BaseModel
+from pydantic import BaseModel # type: ignore
+# from utils import generate_description # type: ignore
 
 # Initialize FastAPI app
 load_dotenv()
 app = FastAPI()
-client = OpenAI()
+# client = OpenAI()
+print("====================HELLO JEE CHAYE PEE LO======================")
+print(os.environ.get("OPENAI_API_KEY"))
 # Setup OpenAI API Key
 client = OpenAI(
-    api_key = os.getenv('OPENAI_API_KEY')
+    api_key=os.environ.get("OPENAI_API_KEY")
 )
 
-# Input Model
+# # Input Model
 class ArticleRequest(BaseModel):
     title: str
     word_count: int
@@ -29,9 +32,9 @@ async def generate_article(request: ArticleRequest):
                   "Keep the article concise, informative, and plagiarism-free.")
 
         # Request completion from OpenAI
-        response = openai.Completion.create(
-            engine="gpt-3.5-turbo",
-            prompt=prompt,
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=prompt,
             max_tokens=request.word_count
         )
 
