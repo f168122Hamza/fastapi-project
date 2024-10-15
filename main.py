@@ -95,6 +95,7 @@ async def generate_article(request: ArticleRequest):
             f"As a talented writer and SEO expert, write a detailed article on my topic '{request.title}'."
             "The article's length must be 2000 words and it is a must."
             "Paragraph length must be 300 words"
+            "Add heading to paragraph with : where needed"
             "Maximum number of paragraphs should be 10"
             "Always give a SEO optimised title as 'Title:' that complements the article at the start of article"
             "Write like a human, with more spoken language. It is a must!"
@@ -296,6 +297,31 @@ def clean_article(response):
     second_half = " ".join(second_half_words)
 
     total_paragraphs = cleaned_answer.count("<p>") + 1
+
+    title_pattern = re.compile(r'([A-Z][\w\s]+:)\s')
+
+    # Split the text into paragraphs by paragraph tags or periods followed by space
+    paragraphs = re.split(r'(</p>|\. )', cleaned_answer)
+
+    formatted_paragraphs = []
+
+    for paragraph in paragraphs:
+        # Search for a title at the beginning of the paragraph
+        match = title_pattern.search(paragraph)
+
+        if match:
+            title = match.group(1)
+            rest_of_paragraph = paragraph[match.end():]
+            title = re.sub(r":", "", title)
+            
+            # Add the formatted title (bold and on a separate line)
+            formatted_paragraphs.append(f"<b><p>{title}</p></b>{rest_of_paragraph}")
+        else:
+            # No title, just append the paragraph as it is
+            formatted_paragraphs.append(paragraph)
+
+    # Join the paragraphs back into a single formatted string
+    cleaned_answer = "\n\n".join(formatted_paragraphs)
 
     return {
         "article": cleaned_answer,
