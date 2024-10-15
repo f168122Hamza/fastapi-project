@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Depends, HTTPException
 from dotenv import load_dotenv
 from openai import OpenAI
 import requests
@@ -11,6 +11,25 @@ from docx import Document
 from docx.shared import RGBColor
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
+import boto3
+from botocore.exceptions import NoCredentialsError
+from sqlalchemy.orm import Session
+from typing import List
+from schemas import ArticleSchema
+import models
+import schemas
+from database import get_db, engine, SessionLocal
+from models import Article
+from requests.auth import HTTPBasicAuth
+import mimetypes
+from PIL import Image, PngImagePlugin
+import piexif
+
+# Create the database tables
+models.Base.metadata.create_all(bind=engine)
+Article.__table__.create(bind=engine, checkfirst=True)
+# Create a session
+db: Session = SessionLocal()
 
 # Initialize FastAPI app and load environment variables
 load_dotenv()
@@ -26,6 +45,31 @@ print(os.environ.get("ZERO_GPT_API_KEY"))
 api_key = os.environ.get("CHATBOT_KEY")
 paraphrase_api_key = os.environ.get("PARAPHRASE_KEY")
 zero_gpt_api_key = os.environ.get("ZERO_GPT_API_KEY")
+aws_access_key = os.environ.get("AWS_ACCESS_KEY")
+aws_secret_key = os.environ.get("AWS_SECRET_KEY")
+aws_region = os.environ.get("AWS_REGION")
+aws_bucket_name = os.environ.get("AWS_BUCKET_NAME")
+
+# WordPress Configuration
+wp_site_url = os.getenv("WP_SITE_URL")  # e.g., https://example.com
+wp_username = os.getenv("WP_USERNAME")  # WordPress Username
+wp_password = os.getenv("WP_PASSWORD")  # WordPress Password
+
+# Define the API endpoint for creating a new post in WordPress
+endpoint = f"{wp_site_url}/wp-json/wp/v2/posts"
+media_endpoint = f"{wp_site_url}/wp-json/wp/v2/media"
+
+# Define S3 client
+s3_client = boto3.client(
+    "s3",
+    aws_access_key_id=aws_access_key,
+    aws_secret_access_key=aws_secret_key,
+    region_name=aws_region,
+)
+
+local_file_name = "images/image_generated.png"
+local_file_name2 = "images/image_generated1.png"
+wp_image_name = "images/wp_image_name.png"
 
 
 # Input Model for request body
@@ -33,12 +77,15 @@ class ArticleRequest(BaseModel):
     title: str
     word_count: int
 
-
 class ImageRequest(BaseModel):
     article_title: str
     article_content: str
 
-
+class PostToWordPressRequest(BaseModel):
+    article_id: int
+    wp_category_id: int
+    tags: List[str] = []
+    
 # Generate an article based on a title
 @app.post("/generate-article/")
 async def generate_article(request: ArticleRequest):
@@ -46,81 +93,129 @@ async def generate_article(request: ArticleRequest):
         # ChatGPT prompt that encourages a human-like tone and discourages AI mentions
         prompt = (
             f"As a talented writer and SEO expert, write a detailed article on my topic '{request.title}'."
-                "The article's length must be between 2000 words and it is a must."
-                "Paragraph length must be 300 words"
-                "Maximum number of paragraphs should be 7"
-                "Give a SEO optimised 'Title' that complements the article"
-                "Write like a human, with more spoken language. It is a must!"
-                "For every new paragraph start put --- in the start"
-                "No spelling or grammer mistake should be in any paragraph"
-                # "2. You should hyperlink to every important term that is related to the online relevant resources you have researched. Furthermore, you should include the secondary keywords in the article and bolden them."
-                # "Use semantically relevant keywords about my topic in bold format to improve semantic SEO"
-                # "6. The article should help readers with a step-by-step guide where appropriate."
-                # "7. Hyperlink every important term/phrase to the online relevant resource to add more context. readers to buy the product."
-                # "8. The article should confidently convince"
-                # "9. Format in bold style where my keywords are present."
-                # "10. Format the article with h1, h2, h3, h4, and other formatting styles in an appropriate manner"
-                # "Now write the publish-ready article for me, there should be no extra thing apart from the main article you wrote for me."
-                "After you have written the article, you need to do the following things:"
-                "Make a paragraph with heading 'SEO Suggestions'"
-                "Suggest primary keyword for my content."
-                "Suggest a kickass meta description within 160 characters for my content."
-            )
-
-        client = OpenAI(api_key=api_key)
-        # Request completion from OpenAI using the correct method and parameters
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "You are a article writer"},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens= 4000,
+            "The article's length must be 2000 words and it is a must."
+            "Paragraph length must be 300 words"
+            "Maximum number of paragraphs should be 10"
+            "Always give a SEO optimised title as 'Title:' that complements the article at the start of article"
+            "Write like a human, with more spoken language. It is a must!"
+            "For every new paragraph start put --- in the start"
+            "No spelling or grammer mistake should be in any paragraph"
+            "After you have written the article, you need to do the following things:"
+            "Make a paragraph with heading 'SEO Suggestions'"
+            "Suggest primary keyword for my content."
+            "Suggest tags for my content."
+            "Suggest a kickass meta description within 160 characters for my content."
         )
 
-        # print("response", response.choices[0].message.content)
-        answer = response.choices[0].message.content
-        # Extract and return the article content from the response
-        formatted_article = format_article(answer)
-        print("answer", formatted_article)
+        client = OpenAI(api_key=api_key)
+        response = generate_response(client, prompt)
 
-        # paraphrased_article = await paraphrase_article_prepostseo(formatted_article)
+        # Check the detection result to determine if the article is good to go
+        while not (
+            response["detection_result"]["success"]
+            and response["detection_result"]["data"]["fakePercentage"] < 40
+            and response["detection_result"]["data"]["textWords"] > 1000
+        ):
+            print("Regenerating Article as the conditions are not met...")
+            response = generate_response(client, prompt)
+
+        print("Article is good to go")
+
+        title = response["seo_suggestions"]["title"]
+        article_image1 = generate_image_from_article(
+            response["seo_suggestions"]["first_half"], title
+        )
+        article_image2 = generate_image_from_article(
+            response["seo_suggestions"]["second_half"], title
+        )
+
+        print("Images Generated Successfully")
+
+        download_image(article_image1["image_url"], local_file_name)
+        print("Image 1 downloaded")
+
+        download_image(article_image2["image_url"], local_file_name2)
+        print("Image 2 downloaded")
+
+        cleaned_title = title.replace("<p>", "").replace("</p>", "").strip()
+        final_title = cleaned_title.replace(" ", "_").lower()
+
+        print("Final Title is: ", final_title)
+
+        # S3 object name (path in the bucket)
+        s3_file_name1 = f"articles_images/{final_title}.png"
+        s3_file_name2 = f"articles_images/{final_title}2.png"
+
+        # Upload the image to S3
+        article_image_url1 = upload_image_to_s3(local_file_name, aws_bucket_name, s3_file_name1)
+        article_image_url2 = upload_image_to_s3(local_file_name2, aws_bucket_name, s3_file_name2)
+
+        article_images = [article_image_url1, article_image_url2]
+        print("Images has been uploaded")
+        # Return the generated article and AI detection result
         
-        seo_suggestions = clean_article(formatted_article)
-        print("SEO suggestions", seo_suggestions)
-        detection_result = detect_ai_content(formatted_article)
-        if detection_result['success'] and detection_result['data']['fakePercentage'] < 40 and detection_result['data']['textWords'] > 1000 :
-            print("Article is good to go")
-        else:
-            print("Regenerate Article as percentage is high")
-            # generate_article()
-
-        # print("detection_result", detection_result)
-
+        tags = get_tags(response["seo_suggestions"]['seo_suggestions'])
+        create_article(response, cleaned_title, article_images, request.title, tags)
+        print("Article has been stored in database")
+        
+        generate_html_file(response['seo_suggestions']['article'], cleaned_title, article_images)
         return {
-            "article": formatted_article,
-            "ai_detection": detection_result
+            "seo_suggestions": response["seo_suggestions"],
+            "ai_detection": response["detection_result"],
+            "article_image1": article_image_url1,
+            "article_image2": article_image_url2,
         }
 
     except Exception as e:
         # Return an error message if something goes wrong
         raise HTTPException(status_code=500, detail=str(e))
 
+
+def generate_response(client, prompt):
+    try:
+        # Request completion from OpenAI API
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "You are a talented article writer."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=4000,
+        )
+        # Extract the content from the response
+        answer = response.choices[0].message.content
+
+        # Process the article (mocked functions for formatting, SEO, and AI detection)
+        formatted_article = format_article(answer)
+        seo_suggestions = clean_article(formatted_article)
+        detection_result = detect_ai_content(formatted_article)
+
+        return {
+            "detection_result": detection_result,
+            "seo_suggestions": seo_suggestions,
+            # "formatted_article": formatted_article,
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Error generating response: {str(e)}"
+        )
+
+
 ZERO_GPT_API_URL = "https://api.zerogpt.com/api/detect/detectText"
+
 
 def detect_ai_content(text):
     # Ensure the text is not empty or None
     if not text or text.strip() == "":
         return {"error": "Input text cannot be empty or None"}
 
-    headers = {
-        'ApiKey': zero_gpt_api_key,
-        'Content-Type': 'application/json'
-    }
-    payload = json.dumps({
-        "text": text,
-        "input_text": text  # Ensure this field has a valid non-empty string
-    })
+    headers = {"ApiKey": zero_gpt_api_key, "Content-Type": "application/json"}
+    payload = json.dumps(
+        {
+            "text": text,
+            "input_text": text,  # Ensure this field has a valid non-empty string
+        }
+    )
 
     try:
         # Synchronous POST request to the ZeroGPT API
@@ -134,125 +229,176 @@ def detect_ai_content(text):
     except Exception as err:
         print(f"An error occurred: {err}")
         return {"error": str(err)}
-        
-async def paraphrase_article_prepostseo(text: str) -> str:
-    try:
-        # PrepostSEO API endpoint
-        api_url = "https://www.prepostseo.com/apis/checkparaphrase"
-        
-        # Payload for the POST request
-        payload = {
-            'key': paraphrase_api_key,  # Your PrepostSEO API key
-            'data': text,  # The text to be paraphrased
-            'lang': 'en',  # Language: 'en' for English
-            'mode': 'Advanced'  # Paraphrasing mode: Simple, Advanced, Fluency, Creative (optional)
-        }
 
-        # Sending POST request to PrepostSEO API
-        response = requests.post(api_url, data=payload)
 
-        if response.status_code == 200:
-            # Extract the paraphrased text from the response
-            response_text = response.content.decode('utf-8-sig')
-            # print("=======================Simple Response========================")
-            # print("Response:", response_text)
-            paraphrased_text = json.loads(response_text).get('paraphrasedContent')
-            # print("=======================Paraphrased Without Article========================")
-            # print("Simple Article:", text)
-            # print("=======================Paraphrased Article========================")
-            print("Paraphrased Article:", paraphrased_text)
-            return paraphrased_text
-        else:
-            raise Exception(f"Failed to paraphrase text. Status code: {response.status_code}, Response: {response.text}")
+def extract_main_title(title):
+    # Use regular expression to capture the part after the first colon and any leading/trailing spaces
+    match = re.search(r":\s*(.*)", title)
+    if match:
+        # Extract the matched part and return it
+        main_title = match.group(1).strip()
+        return main_title
+    return title  #
 
-    except Exception as e:
-        raise Exception(f"Error while paraphrasing: {str(e)}")
 
 def format_article(text):
     # Remove special characters and extra whitespaces
-    cleaned_text = re.sub(r'[^A-Za-z0-9,.?!;:\-\(\)\s]', '', text)
-    cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
+    cleaned_text = re.sub(r"[^A-Za-z0-9,.?!;:\-\(\)\s]", "", text)
+    cleaned_text = re.sub(r"\s+", " ", cleaned_text).strip()
 
     # Format the article into paragraphs and sections
-    formatted_text = cleaned_text.replace(' ## ', '\n\n## ')
-    formatted_text = formatted_text.replace(' ### ', '\n\n### ')
-    formatted_text = formatted_text.replace(' - ', '\n\n- ')
-    formatted_text = formatted_text.replace(' 1. ', '\n\n1. ')
-    
+    formatted_text = cleaned_text.replace(" ## ", "\n\n## ")
+    formatted_text = formatted_text.replace(" ### ", "\n\n### ")
+    formatted_text = formatted_text.replace(" - ", "\n\n- ")
+    formatted_text = formatted_text.replace(" 1. ", "\n\n1. ")
+
     return formatted_text
 
-# Function to add HTML-styled text to the document
-def add_styled_text(paragraph, text, bold=False, italic=False, color=None):
-    run = paragraph.add_run(text)
-    run.bold = bold
-    run.italic = italic
-    if color:
-        run.font.color.rgb = color
-        
+
 def clean_article(response):
     # Remove inline styles from the response
-    cleaned_answer = re.sub(r'style=\"[^\"]*\"', '', response)
-    
+    cleaned_answer = re.sub(r"style=\"[^\"]*\"", "", response)
+
     # Insert a new paragraph tag where '---' appears
-    cleaned_answer = re.sub(r'---', '</p><p>', cleaned_answer)
-    # cleaned_answer = re.sub(r'. - ', '', cleaned_answer)
-    
-    
-    seo_suggestions = ''
-    seo_match = re.search(r'(SEO Suggestions.*?)(?=---|<\/p>|$)', cleaned_answer, re.DOTALL)
+    cleaned_answer = re.sub(r"---", "</p><p>", cleaned_answer)
+
+    title_match = re.search(r"Title:\s*(.*?)(?=<p>|---|$)", cleaned_answer, re.DOTALL)
+    title = title_match.group(1).strip() if title_match else ""
+
+    final_title = ""
+    # Remove the title line from the cleaned_answer
+    if title:
+        cleaned_answer = cleaned_answer.replace(f"Title: {title}", "", 1)
+        final_title = extract_main_title(title)
+    seo_suggestions = ""
+    seo_match = re.search(
+        r"(SEO Suggestions.*?)(?=---|<\/p>|$)", cleaned_answer, re.DOTALL
+    )
     if seo_match:
         seo_suggestions = seo_match.group(1).strip()
-        cleaned_answer = cleaned_answer.replace(seo_suggestions, '')
+        cleaned_answer = cleaned_answer.replace(seo_suggestions, "")
 
-    total_paragraphs = cleaned_answer.count('<p>') + 1
+    cleaned_answer = cleaned_answer.strip()
 
-    # Define the HTML content with the cleaned and modified answer
+    words = cleaned_answer.split()
+
+    # Set the maximum word limit for each half
+    max_words = 350
+
+    # Get the first half up to 350 words
+    first_half_words = words[:max_words]
+
+    # Get the second half up to 350 words (starting from where the first half ended)
+    second_half_words = words[max_words : max_words * 2]
+
+    # Join the words back into strings
+    first_half = " ".join(first_half_words)
+    second_half = " ".join(second_half_words)
+
+    total_paragraphs = cleaned_answer.count("<p>") + 1
+
+    return {
+        "article": cleaned_answer,
+        "seo_suggestions": seo_suggestions,
+        "total_paragraphs": total_paragraphs,
+        "title": final_title,
+        "first_half": first_half,
+        "second_half": second_half,
+    }
+
+def generate_html_file(article_data, title, images):
+     # Define the HTML content with the cleaned and modified answer
+   # Split the `article_data` into paragraphs using `<p>` tags.
+    paragraphs = article_data.split("</p>")
+
+    # Remove any empty paragraphs that might result from splitting.
+    paragraphs = [para for para in paragraphs if para.strip()]
+
+    # Add the closing `</p>` tag back to each paragraph to preserve HTML structure.
+    paragraphs = [para + "</p>" for para in paragraphs]
+
+    print("Length of paragraphs", len(paragraphs))
+    # Insert images after specific paragraphs.
+    if(len(paragraphs) == 7):
+        if len(paragraphs) > 2:
+            paragraphs.insert(2, f'<img width="700px" src="{images[0]}" alt="Image 1"/>')
+        if len(paragraphs) > 5:
+            paragraphs.insert(6, f'<img width="700px" src="{images[1]}" alt="Image 2"/>')
+    else:
+        if len(paragraphs) > 6:
+            paragraphs.insert(6, f'<img width="700px" src="{images[1]}" alt="Image 2"/>')
+
+    # Join the paragraphs and images back into a single HTML string.
+    modified_article_content = "\n".join(paragraphs)
+
+    # Define the complete HTML content.
     html_content = f"""
     <!DOCTYPE html>
     <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>API Response Display</title>
-        <style>
-            body {{
-                font-family: Arial, sans-serif;
-                margin: 20px;
-                background-color: #f4f4f4;
-            }}
-            .content {{
-                background-color: #fff;
-                border: 1px solid #ddd;
-                padding: 20px;
-                border-radius: 5px;
-                box-shadow: 0 0 10px rgba(0,0,0,0.1);
-            }}
-        </style>
-    </head>
+  
     <body>
-        <h1>API Response Content</h1>
         <div class="content">
-            <p>{cleaned_answer}</p>
+            {modified_article_content}
         </div>
     </body>
     </html>
     """
+
+    # Write the HTML content to an HTML file.
+    with open("api_response.html", "w") as html_file:
+        html_file.write(html_content)
+
+    print("HTML file created successfully: api_response.html")
 
     # Write the HTML content to an HTML file
     with open("api_response.html", "w") as html_file:
         html_file.write(html_content)
 
     print("HTML file created successfully: api_response.html")
-    return { "seo_suggestions": seo_suggestions, "total_paragraphs": total_paragraphs }
+    return html_content
 
-    
-@app.post("/generate-image/")
-async def generate_image(request: ImageRequest):
+def download_image(image_url: str, local_file_name: str):
+    response = requests.get(image_url, stream=True)
+    if response.status_code == 200:
+        with open(local_file_name, "wb") as file:
+            for chunk in response.iter_content(1024):
+                file.write(chunk)
+        print(f"Image downloaded successfully: {local_file_name}")
+    else:
+        raise Exception(
+            f"Failed to download image. Status code: {response.status_code}"
+        )
+
+
+def upload_image_to_s3(local_file_name: str, bucket_name: str, s3_file_name: str):
     try:
-        # Use article content as a prompt to generate an image using DALL-E
-        image_prompt = f"Create an image that visually represents the following article: {request.article_content}"
+        s3_client.upload_file(
+            local_file_name,
+            bucket_name,
+            s3_file_name,
+            ExtraArgs={
+                "ContentType": "image/png",  # Set the correct MIME type
+                "ContentDisposition": "inline",  # Ensure the image opens in the browser
+            },
+        )
+        print(f"Image uploaded to S3 successfully: s3://{bucket_name}/{s3_file_name}")
+        
+        image_url = f"https://{bucket_name}.s3.{aws_region}.amazonaws.com/{s3_file_name}"
+        print(f"Image uploaded successfully. URL: {image_url}")
+        return image_url
+    except FileNotFoundError:
+        print(f"The file was not found: {local_file_name}")
+    except NoCredentialsError:
+        print("Credentials not available")
 
+def generate_image_from_article(content, title) -> dict:
+    try:
+        # Construct the image prompt from the article content
+        image_prompt = f"Create a wide-angle, ultra-realistic image based on the following context and it should appears as if captured in real life. {content}"
+
+        # Initialize the OpenAI client with the API key
         client = OpenAI(api_key=api_key)
+
         # Generate the image using DALL·E
         response = client.images.generate(
             model="dall-e-3",
@@ -261,22 +407,250 @@ async def generate_image(request: ImageRequest):
             quality="standard",
             n=1,
         )
-        # image_response = openai.Image.create(
-        #     prompt=image_prompt,
-        #     n=1,  # Number of images to generate
-        #     size="1024x1024"  # Image resolution (other options: "256x256", "512x512")
-        # )
 
-        # Extract the URL of the generated image
+        # Retrieve the URL of the generated image
         image_url = response.data[0].url
 
-        return {"title": request.article_title, "image_url": image_url}
+        # Return the image URL and title
+        return {"title": title, "image_url": image_url}
 
     except Exception as e:
+        # Raise an HTTP exception with the error message in case of failure
         raise HTTPException(status_code=500, detail=str(e))
+
+def create_article(article_data, title, images, keyword, tags):
+    articleData = {
+        "title": title,
+        "article": article_data['seo_suggestions']['article'],
+        "image_url": images,
+        "keyword": keyword,
+        "ai_percentage": article_data['detection_result']['data']['fakePercentage'],
+        "total_words":  article_data['detection_result']['data']['textWords'],
+        "seo_suggestion": article_data['seo_suggestions']['seo_suggestions'],
+        "total_paragraphs": article_data['seo_suggestions']['total_paragraphs'],
+        "tags": tags
+    }
+        
+    print("Article Object is", articleData)
+    # Create an Article instance from the input data
+    new_article = Article(**articleData)
+    
+    # Add and commit the new article to the session
+    db.add(new_article)
+    db.commit()
+    db.refresh(new_article)  # Refresh to get generated ID and other values
+    
+    return new_article
+
+@app.post("/generate-image/")
+async def generate_image(request: ImageRequest):
+    # Call the function to generate the image
+    result = generate_image_from_article(request.article_content, request.article_title)
+    return result
 
 
 # Optional - Endpoint to check API health
 @app.get("/")
 def read_root():
     return {"status": "API is up and running"}
+
+# Get all articles
+@app.get("/articles/", response_model=List[ArticleSchema])
+def get_articles(skip: int = 0, limit: int = 10, db: Session = Depends(get_db)):
+    # Query the database for articles
+    articles = db.query(Article).offset(skip).limit(limit).all()
+
+    # Ensure that fields are correctly formatted before returning them
+    for article in articles:
+        # Convert `seo_suggestion` to a dictionary if it's a JSON string
+        if article.seo_suggestion and isinstance(article.seo_suggestion, str):
+            try:
+                article.seo_suggestion = json.loads(article.seo_suggestion)
+            except ValueError:
+                # If it can't be parsed, set it to an empty dictionary
+                article.seo_suggestion = {}
+
+        # If `seo_suggestion` is None or not a dict, ensure it's set to {}
+        if article.seo_suggestion is None or not isinstance(article.seo_suggestion, dict):
+            article.seo_suggestion = {}
+
+        # Ensure that `image_url` is a list if it's a JSON string or None
+        if article.image_url and isinstance(article.image_url, str):
+            try:
+                article.image_url = json.loads(article.image_url)
+            except ValueError:
+                article.image_url = []
+
+        # If `image_url` is None or not a list, set it to an empty list
+        if article.image_url is None or not isinstance(article.image_url, list):
+            article.image_url = []
+
+        # Convert datetime fields to strings for JSON serialization
+        if article.created_at:
+            article.created_at = article.created_at.isoformat()
+        if article.updated_at:
+            article.updated_at = article.updated_at.isoformat()
+        if article.deleted_at:
+            article.deleted_at = article.deleted_at.isoformat()
+
+    return articles
+
+def post_to_wp(title: str, content: str, category_id: int, tags: List[str], featured_media: int):
+
+    # Prepare the payload for the post
+    post_data = {
+        "title": title,
+        "content": content,
+        "status": "publish",
+        "date": "2024-09-05T15:30:00",
+        "categories": [category_id],
+        # "tags": tags,
+        "featured_media": featured_media
+    }
+
+    # Use basic authentication to authenticate with the WordPress API
+    response = requests.post(
+        endpoint,
+        json=post_data,
+        auth=(wp_username, wp_password),
+        headers={"Content-Type": "application/json"},
+    )
+
+    # Check if the request was successful
+    if response.status_code == 201:
+        return response.json()
+    else:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=f"Failed to post article to WordPress: {response.content}",
+        )
+
+# Define the new endpoint for posting articles to WordPress
+@app.post("/post-to-wordpress/")
+def post_article_to_wordpress(request: PostToWordPressRequest, db: Session = Depends(get_db)):
+    """
+    API endpoint to post an article to WordPress.
+    """
+    # Fetch the article from the database using the provided article_id
+    article = db.query(Article).filter(Article.id == request.article_id).first()
+
+    if not article:
+        raise HTTPException(status_code=404, detail="Article not found")
+
+    print("Article id", article.image_url[0])
+    article_data = generate_html_file(article.article, article.title, article.image_url)
+    media_id = upload_image_to_wp(article.image_url[0])
+    
+    print("Image uploaded", media_id)
+    # Post the article to WordPress
+    response = post_to_wp(
+        title=article.title,
+        content=article_data,
+        category_id=request.wp_category_id,
+        tags=article.tags,
+        featured_media= media_id,
+    )
+    print("Article uploaded")
+
+    return {
+        "message": "Article posted to WordPress successfully",
+        "wordpress_response": response,
+    }
+    
+def get_tags(text):
+    print("We are in get tags", text)
+    # Use a regular expression to find the tags after "Suggested Tags:"
+    match = re.search(r"Tags:\s*([a-zA-Z0-9,\s-]+)", text)
+    print("Match text", match)
+
+    # Check if the match was found and extract the tags
+    if match:
+        tags_str = match.group(1)
+        # Split the tags string into a list by separating at commas
+        tags = [tag.strip() for tag in tags_str.split(",")]
+
+    # Print the extracted tags
+    print(tags)
+    return tags
+
+def upload_image_to_wp(image_url):
+    download_image(image_url, wp_image_name)
+    
+    print(image_url, wp_image_name)
+    local_image_path = "images/wp_image_name.png"
+    media_endpoint = f"{wp_site_url}/wp-json/wp/v2/media"
+    
+    headers = { "Accept": "application/json" }
+
+    response = requests.post(
+        media_endpoint,
+        headers=headers,
+        files={'file': open(local_image_path, 'rb')},
+        auth=(wp_username, wp_password),
+    )
+
+    if response.status_code == 201:
+        media_response = response.json()
+        media_id = media_response["id"]  # Get the media ID from the response
+        print(f"Image uploaded successfully. Media ID: {media_id}")
+        return media_id
+    else:
+        print(f"Failed to upload image: {response.content}")
+        return None
+        
+# def extract_metadata(image_path):
+#     try:
+#         # Open the image using PIL
+#         image = Image.open(image_path)
+
+#         # Extract basic properties
+#         metadata = {
+#             "format": image.format,
+#             "size": image.size,  # (width, height)
+#             "mode": image.mode,
+#             "info": {  # Add custom metadata fields
+#                 "Dimensions": f"{image.size[0]}x{image.size[1]}",  # e.g., "1792x1024"
+#                 "Format": image.format,  # e.g., "PNG"
+#                 "Mode": image.mode,      # e.g., "RGB"
+#                 "Color Space": "sRGB",   # Specify color space
+#                 "Alpha Channel": "No" if image.mode == "RGB" else "Yes",  # Alpha channel presence
+#             }
+#         }
+#         print(f"Metadata extracted from image: {image_path}")
+#         print(metadata)
+#         return metadata
+#     except Exception as e:
+#         print(f"Error extracting metadata: {str(e)}")
+#         return None
+
+# # Function to add metadata back to the image
+# def add_metadata(image_path, metadata, output_path):
+#     try:
+#         image = Image.open(image_path)
+
+#         if image.format == "PNG":
+#             png_info = PngImagePlugin.PngInfo()
+#             for key, value in metadata["info"].items():
+#                 png_info.add_text(key, str(value))
+#             image.save(output_path, "PNG", pnginfo=png_info)
+#             print(f"Metadata added and image saved as: {output_path}")
+
+#         elif image.format == "JPEG":
+#             exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "Interop": {}, "1st": {}, "thumbnail": None}
+#             if "info" in metadata:
+#                 exif_dict["0th"][piexif.ImageIFD.ImageDescription] = metadata["info"].get("Dimensions", "")
+#                 exif_dict["0th"][piexif.ImageIFD.Make] = metadata["info"].get("Make", "OpenAI DALL-E")
+#                 exif_dict["0th"][piexif.ImageIFD.Model] = metadata["info"].get("Model", "DALL-E Model 3")
+#                 exif_dict["0th"][piexif.ImageIFD.Software] = "PIL.Python"
+#                 exif_dict["0th"][piexif.ImageIFD.XResolution] = (72, 1)
+#                 exif_dict["0th"][piexif.ImageIFD.YResolution] = (72, 1)
+            
+#             exif_bytes = piexif.dump(exif_dict)
+#             image.save(output_path, "jpeg", exif=exif_bytes, quality=85)
+#             print(f"Metadata added and image saved as: {output_path}")
+
+#         else:
+#             print(f"Unsupported image format: {image.format}")
+
+#     except Exception as e:
+#         print(f"Error adding metadata: {str(e)}")
