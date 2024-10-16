@@ -1,63 +1,45 @@
 from fastapi import FastAPI, Depends, HTTPException
+from botocore.exceptions import NoCredentialsError
+from database import get_db, engine, SessionLocal
+from sqlalchemy.orm import Session
+from schemas import ArticleSchema
 from dotenv import load_dotenv
+from pydantic import BaseModel
+from models import Article
 from openai import OpenAI
+from typing import List
 import requests
+import models
+import boto3
 import json
 import os
-from pydantic import BaseModel
 import re
-from bs4 import BeautifulSoup
-from docx import Document
-from docx.shared import RGBColor
-from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
-import boto3
-from botocore.exceptions import NoCredentialsError
-from sqlalchemy.orm import Session
-from typing import List
-from schemas import ArticleSchema
-import models
-import schemas
-from database import get_db, engine, SessionLocal
-from models import Article
-from requests.auth import HTTPBasicAuth
-import mimetypes
-from PIL import Image, PngImagePlugin
-import piexif
 
-# Create the database tables
 models.Base.metadata.create_all(bind=engine)
 Article.__table__.create(bind=engine, checkfirst=True)
-# Create a session
 db: Session = SessionLocal()
 
-# Initialize FastAPI app and load environment variables
 load_dotenv()
 app = FastAPI()
 
-# Print debug information to ensure the API key is loaded correctly
-print("====================HELLO JEE CHAYE PEE LO======================")
-print(os.environ.get("CHATBOT_KEY"))
-print(os.environ.get("PARAPHRASE_KEY"))
-print(os.environ.get("ZERO_GPT_API_KEY"))
-
-# Setup OpenAI API Key
-api_key = os.environ.get("CHATBOT_KEY")
 paraphrase_api_key = os.environ.get("PARAPHRASE_KEY")
 zero_gpt_api_key = os.environ.get("ZERO_GPT_API_KEY")
+zero_gpt_api_url = os.environ.get("ZERO_GPT_API_URL")
+aws_bucket_name = os.environ.get("AWS_BUCKET_NAME")
 aws_access_key = os.environ.get("AWS_ACCESS_KEY")
 aws_secret_key = os.environ.get("AWS_SECRET_KEY")
 aws_region = os.environ.get("AWS_REGION")
-aws_bucket_name = os.environ.get("AWS_BUCKET_NAME")
+api_key = os.environ.get("CHATBOT_KEY")
 
 # WordPress Configuration
-wp_site_url = os.getenv("WP_SITE_URL")  # e.g., https://example.com
-wp_username = os.getenv("WP_USERNAME")  # WordPress Username
-wp_password = os.getenv("WP_PASSWORD")  # WordPress Password
+wp_site_url = os.getenv("WP_SITE_URL")
+wp_username = os.getenv("WP_USERNAME")
+wp_password = os.getenv("WP_PASSWORD")
 
 # Define the API endpoint for creating a new post in WordPress
 endpoint = f"{wp_site_url}/wp-json/wp/v2/posts"
 media_endpoint = f"{wp_site_url}/wp-json/wp/v2/media"
+tags_endpoint = f"{wp_site_url}/wp-json/wp/v2/tags"
 
 # Define S3 client
 s3_client = boto3.client(
@@ -71,11 +53,9 @@ local_file_name = "images/image_generated.png"
 local_file_name2 = "images/image_generated1.png"
 wp_image_name = "images/wp_image_name.png"
 
-
 # Input Model for request body
 class ArticleRequest(BaseModel):
     title: str
-    word_count: int
 
 class ImageRequest(BaseModel):
     article_title: str
@@ -83,16 +63,32 @@ class ImageRequest(BaseModel):
 
 class PostToWordPressRequest(BaseModel):
     article_id: int
+    post_date: str
     wp_category_id: int
-    tags: List[str] = []
+    
+class GenerateAndPostRequest(BaseModel):
+    title: str
+    wp_category_id: int
+    post_date: str
     
 # Generate an article based on a title
-@app.post("/generate-article/")
-async def generate_article(request: ArticleRequest):
+@app.post("/generate-article-api/")
+async def generate_article_api(request: ArticleRequest):
     try:
-        # ChatGPT prompt that encourages a human-like tone and discourages AI mentions
+        article_data = generate_article(request.title)
+        return article_data
+
+    except HTTPException as http_exc:
+        raise http_exc  # Re-raise known HTTP exceptions with the proper status code and message
+
+    except Exception as e:
+        # Handle any unexpected errors
+        raise HTTPException(status_code=500, detail=f"An error occurred while generating the article: {str(e)}")
+
+def generate_article(title: str):
+    try:
         prompt = (
-            f"As a talented writer and SEO expert, write a detailed article on my topic '{request.title}'."
+            f"As a talented writer and SEO expert, write a detailed article on my topic '{title}'."
             "The article's length must be 2000 words and it is a must."
             "Paragraph length must be 300 words"
             "Add heading to paragraph with : where needed"
@@ -110,13 +106,20 @@ async def generate_article(request: ArticleRequest):
 
         client = OpenAI(api_key=api_key)
         response = generate_response(client, prompt)
-
+        
+        max_attempts = 10
+        attempt_count = 0
+        
         # Check the detection result to determine if the article is good to go
         while not (
             response["detection_result"]["success"]
             and response["detection_result"]["data"]["fakePercentage"] < 40
             and response["detection_result"]["data"]["textWords"] > 1000
         ):
+            attempt_count += 1
+            if attempt_count > max_attempts:
+                raise Exception("The limit of attempts has exceeded. Please change the keyword in the title.")
+            
             print("Regenerating Article as the conditions are not met...")
             response = generate_response(client, prompt)
 
@@ -156,11 +159,12 @@ async def generate_article(request: ArticleRequest):
         # Return the generated article and AI detection result
         
         tags = get_tags(response["seo_suggestions"]['seo_suggestions'])
-        create_article(response, cleaned_title, article_images, request.title, tags)
-        print("Article has been stored in database")
+        article = create_article(response, cleaned_title, article_images, title, tags)
+        print("Article has been stored in database", article.id)
         
         generate_html_file(response['seo_suggestions']['article'], cleaned_title, article_images)
         return {
+            "id": article.id,
             "seo_suggestions": response["seo_suggestions"],
             "ai_detection": response["detection_result"],
             "article_image1": article_image_url1,
@@ -168,13 +172,10 @@ async def generate_article(request: ArticleRequest):
         }
 
     except Exception as e:
-        # Return an error message if something goes wrong
         raise HTTPException(status_code=500, detail=str(e))
-
-
+    
 def generate_response(client, prompt):
     try:
-        # Request completion from OpenAI API
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=[
@@ -183,10 +184,7 @@ def generate_response(client, prompt):
             ],
             max_tokens=4000,
         )
-        # Extract the content from the response
         answer = response.choices[0].message.content
-
-        # Process the article (mocked functions for formatting, SEO, and AI detection)
         formatted_article = format_article(answer)
         seo_suggestions = clean_article(formatted_article)
         detection_result = detect_ai_content(formatted_article)
@@ -194,16 +192,11 @@ def generate_response(client, prompt):
         return {
             "detection_result": detection_result,
             "seo_suggestions": seo_suggestions,
-            # "formatted_article": formatted_article,
         }
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Error generating response: {str(e)}"
         )
-
-
-ZERO_GPT_API_URL = "https://api.zerogpt.com/api/detect/detectText"
-
 
 def detect_ai_content(text):
     # Ensure the text is not empty or None
@@ -214,14 +207,13 @@ def detect_ai_content(text):
     payload = json.dumps(
         {
             "text": text,
-            "input_text": text,  # Ensure this field has a valid non-empty string
+            "input_text": text,
         }
     )
 
     try:
-        # Synchronous POST request to the ZeroGPT API
-        response = requests.post(ZERO_GPT_API_URL, headers=headers, data=payload)
-        response.raise_for_status()  # Check if the request was successful
+        response = requests.post(zero_gpt_api_url, headers=headers, data=payload)
+        response.raise_for_status()
         result = response.json()
         return result
     except requests.exceptions.HTTPError as http_err:
@@ -233,21 +225,17 @@ def detect_ai_content(text):
 
 
 def extract_main_title(title):
-    # Use regular expression to capture the part after the first colon and any leading/trailing spaces
     match = re.search(r":\s*(.*)", title)
     if match:
-        # Extract the matched part and return it
         main_title = match.group(1).strip()
         return main_title
-    return title  #
+    return title
 
 
 def format_article(text):
-    # Remove special characters and extra whitespaces
     cleaned_text = re.sub(r"[^A-Za-z0-9,.?!;:\-\(\)\s]", "", text)
     cleaned_text = re.sub(r"\s+", " ", cleaned_text).strip()
-
-    # Format the article into paragraphs and sections
+    
     formatted_text = cleaned_text.replace(" ## ", "\n\n## ")
     formatted_text = formatted_text.replace(" ### ", "\n\n### ")
     formatted_text = formatted_text.replace(" - ", "\n\n- ")
@@ -323,6 +311,9 @@ def clean_article(response):
     # Join the paragraphs back into a single formatted string
     cleaned_answer = "\n\n".join(formatted_paragraphs)
 
+    cleaned_answer = re.sub(r'\n\n\s*\.\s*\n\n', '. ', cleaned_answer)  # Fix space before period
+    cleaned_answer = re.sub(r'\n\n', ' ', cleaned_answer)  # Remove unnecessary line breaks
+
     return {
         "article": cleaned_answer,
         "seo_suggestions": seo_suggestions,
@@ -333,10 +324,8 @@ def clean_article(response):
     }
 
 def generate_html_file(article_data, title, images):
-     # Define the HTML content with the cleaned and modified answer
-   # Split the `article_data` into paragraphs using `<p>` tags.
     paragraphs = article_data.split("</p>")
-
+    
     # Remove any empty paragraphs that might result from splitting.
     paragraphs = [para for para in paragraphs if para.strip()]
 
@@ -403,8 +392,8 @@ def upload_image_to_s3(local_file_name: str, bucket_name: str, s3_file_name: str
             bucket_name,
             s3_file_name,
             ExtraArgs={
-                "ContentType": "image/png",  # Set the correct MIME type
-                "ContentDisposition": "inline",  # Ensure the image opens in the browser
+                "ContentType": "image/png",
+                "ContentDisposition": "inline",
             },
         )
         print(f"Image uploaded to S3 successfully: s3://{bucket_name}/{s3_file_name}")
@@ -420,7 +409,7 @@ def upload_image_to_s3(local_file_name: str, bucket_name: str, s3_file_name: str
 def generate_image_from_article(content, title) -> dict:
     try:
         # Construct the image prompt from the article content
-        image_prompt = f"Create a wide-angle, ultra-realistic image based on the following context and it should appears as if captured in real life. {content}"
+        image_prompt = f"Create a wide-angle, ultra-realistic image based on the following context and it should appears as if captured in real life. And there should be no text written on the image {content}"
 
         # Initialize the OpenAI client with the API key
         client = OpenAI(api_key=api_key)
@@ -521,17 +510,27 @@ def get_articles(skip: int = 0, limit: int = 10, db: Session = Depends(get_db)):
 
     return articles
 
-def post_to_wp(title: str, content: str, category_id: int, tags: List[str], featured_media: int):
+def post_to_wp(article_id, post_date, category_id):
 
+    article = db.query(Article).filter(Article.id == article_id).first()
+
+    if not article:
+        raise HTTPException(status_code=404, detail="Article not found")
+
+    article_data = generate_html_file(article.article, article.title, article.image_url)
+    media_id = upload_image_to_wp(article.image_url[0])
+    
+    tag_ids = [get_or_create_tag(tag) for tag in article.tags]
+    print("Tag ids", tag_ids)
     # Prepare the payload for the post
     post_data = {
-        "title": title,
-        "content": content,
+        "title": article.title,
+        "content": article_data,
         "status": "publish",
-        "date": "2024-09-05T15:30:00",
+        "date": post_date,
         "categories": [category_id],
-        # "tags": tags,
-        "featured_media": featured_media
+        "tags": tag_ids,
+        "featured_media": media_id
     }
 
     # Use basic authentication to authenticate with the WordPress API
@@ -554,27 +553,11 @@ def post_to_wp(title: str, content: str, category_id: int, tags: List[str], feat
 # Define the new endpoint for posting articles to WordPress
 @app.post("/post-to-wordpress/")
 def post_article_to_wordpress(request: PostToWordPressRequest, db: Session = Depends(get_db)):
-    """
-    API endpoint to post an article to WordPress.
-    """
-    # Fetch the article from the database using the provided article_id
-    article = db.query(Article).filter(Article.id == request.article_id).first()
-
-    if not article:
-        raise HTTPException(status_code=404, detail="Article not found")
-
-    print("Article id", article.image_url[0])
-    article_data = generate_html_file(article.article, article.title, article.image_url)
-    media_id = upload_image_to_wp(article.image_url[0])
-    
-    print("Image uploaded", media_id)
     # Post the article to WordPress
     response = post_to_wp(
-        title=article.title,
-        content=article_data,
-        category_id=request.wp_category_id,
-        tags=article.tags,
-        featured_media= media_id,
+        article_id=request.article_id,
+        post_date=request.post_date,
+        category_id=request.wp_category_id
     )
     print("Article uploaded")
 
@@ -604,7 +587,6 @@ def upload_image_to_wp(image_url):
     
     print(image_url, wp_image_name)
     local_image_path = "images/wp_image_name.png"
-    media_endpoint = f"{wp_site_url}/wp-json/wp/v2/media"
     
     headers = { "Accept": "application/json" }
 
@@ -623,60 +605,45 @@ def upload_image_to_wp(image_url):
     else:
         print(f"Failed to upload image: {response.content}")
         return None
+   
+def get_or_create_tag(tag_name: str) -> int:
+    # Define the tag endpoint
+    
+    # Search for the tag by name
+    response = requests.get(tags_endpoint, params={"search": tag_name}, auth=(wp_username, wp_password))
+    
+    if response.status_code == 200:
+        tags = response.json()
+        # If tag exists, return its ID
+        if tags:
+            return tags[0]['id']
+    
+    # If tag doesn't exist, create it
+    create_tag_response = requests.post(
+        tags_endpoint,
+        json={"name": tag_name},
+        auth=(wp_username, wp_password),
+        headers={"Content-Type": "application/json"},
+    )
+    
+    if create_tag_response.status_code == 201:
+        return create_tag_response.json()['id']
+    else:
+        raise HTTPException(
+            status_code=create_tag_response.status_code,
+            detail=f"Failed to create tag: {create_tag_response.content.decode()}",
+        )
         
-# def extract_metadata(image_path):
-#     try:
-#         # Open the image using PIL
-#         image = Image.open(image_path)
+@app.post("/generate-and-post-article/")
+async def generate_and_post_article(request: GenerateAndPostRequest):
+    try:
+        article_data = generate_article(request.title)
+        print("article_data", article_data)
+        post_to_wp(article_data["id"], request.post_date, request.wp_category_id)
+        return article_data
 
-#         # Extract basic properties
-#         metadata = {
-#             "format": image.format,
-#             "size": image.size,  # (width, height)
-#             "mode": image.mode,
-#             "info": {  # Add custom metadata fields
-#                 "Dimensions": f"{image.size[0]}x{image.size[1]}",  # e.g., "1792x1024"
-#                 "Format": image.format,  # e.g., "PNG"
-#                 "Mode": image.mode,      # e.g., "RGB"
-#                 "Color Space": "sRGB",   # Specify color space
-#                 "Alpha Channel": "No" if image.mode == "RGB" else "Yes",  # Alpha channel presence
-#             }
-#         }
-#         print(f"Metadata extracted from image: {image_path}")
-#         print(metadata)
-#         return metadata
-#     except Exception as e:
-#         print(f"Error extracting metadata: {str(e)}")
-#         return None
+    except HTTPException as http_exc:
+        raise http_exc
 
-# # Function to add metadata back to the image
-# def add_metadata(image_path, metadata, output_path):
-#     try:
-#         image = Image.open(image_path)
-
-#         if image.format == "PNG":
-#             png_info = PngImagePlugin.PngInfo()
-#             for key, value in metadata["info"].items():
-#                 png_info.add_text(key, str(value))
-#             image.save(output_path, "PNG", pnginfo=png_info)
-#             print(f"Metadata added and image saved as: {output_path}")
-
-#         elif image.format == "JPEG":
-#             exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "Interop": {}, "1st": {}, "thumbnail": None}
-#             if "info" in metadata:
-#                 exif_dict["0th"][piexif.ImageIFD.ImageDescription] = metadata["info"].get("Dimensions", "")
-#                 exif_dict["0th"][piexif.ImageIFD.Make] = metadata["info"].get("Make", "OpenAI DALL-E")
-#                 exif_dict["0th"][piexif.ImageIFD.Model] = metadata["info"].get("Model", "DALL-E Model 3")
-#                 exif_dict["0th"][piexif.ImageIFD.Software] = "PIL.Python"
-#                 exif_dict["0th"][piexif.ImageIFD.XResolution] = (72, 1)
-#                 exif_dict["0th"][piexif.ImageIFD.YResolution] = (72, 1)
-            
-#             exif_bytes = piexif.dump(exif_dict)
-#             image.save(output_path, "jpeg", exif=exif_bytes, quality=85)
-#             print(f"Metadata added and image saved as: {output_path}")
-
-#         else:
-#             print(f"Unsupported image format: {image.format}")
-
-#     except Exception as e:
-#         print(f"Error adding metadata: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An error occurred while generating the article: {str(e)}")
