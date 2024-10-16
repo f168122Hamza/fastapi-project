@@ -638,7 +638,6 @@ def get_or_create_tag(tag_name: str) -> int:
 async def generate_and_post_article(request: GenerateAndPostRequest):
     try:
         article_data = generate_article(request.title)
-        print("article_data", article_data)
         post_to_wp(article_data["id"], request.post_date, request.wp_category_id)
         return article_data
 
